@@ -91,6 +91,12 @@ class FuncDef(Stmt):
 
 
 @dataclass
+class ClassDef(Stmt):
+    name: str
+    block: Block
+
+
+@dataclass
 class ReturnStmt(Stmt):
     value: Expr | None
 
@@ -153,12 +159,19 @@ class Index(Expr):
 
 
 @dataclass
+class Property(Expr):
+    target: Expr
+    name: str
+
+
+@dataclass
 class CompileResult:
     program: Program
     python_code: str
 
 
 WORDS = {
+    "定义类": "CLASS",
     "如果": "IF", "否则如果": "ELIF", "否则": "ELSE", "当": "WHILE", "重复": "REPEAT", "对于": "FOR", "在": "IN",
     "定义": "DEF", "返回": "RETURN", "继续": "CONTINUE", "跳出": "BREAK", "令": "LET",
     "真": "TRUE", "假": "FALSE", "空": "NONE", "且": "AND", "并且": "AND", "或": "OR", "或者": "OR", "非": "NOT",
@@ -176,7 +189,7 @@ class Lexer:
     def tokenize(self) -> list[Token]:
         out: list[Token] = []
         single = {"{": "LBRACE", "}": "RBRACE", "(": "LPAREN", ")": "RPAREN", "[": "LBRACKET", "]": "RBRACKET",
-                  ",": "COMMA", ":": "COLON", "+": "PLUS", "-": "MINUS", "*": "STAR", "/": "SLASH", "%": "PERCENT",
+                  ",": "COMMA", ":": "COLON", ".": "DOT", "+": "PLUS", "-": "MINUS", "*": "STAR", "/": "SLASH", "%": "PERCENT",
                   "=": "ASSIGN", "<": "LT", ">": "GT"}
         while not self._end():
             ch = self._peek()
@@ -301,6 +314,7 @@ class Parser:
         return Program(stmts)
 
     def stmt(self) -> Stmt:
+        if self._match("CLASS"): return self.class_stmt()
         if self._match("IF"): return self.if_stmt()
         if self._match("WHILE"): return self.while_stmt()
         if self._match("REPEAT"): return self.repeat_stmt()
@@ -329,16 +343,26 @@ class Parser:
             return None
 
         expr: Expr = Name(self._adv().value)
-        while self._match("LBRACKET"):
-            key = self.expr()
-            self._expect("RBRACKET", "索引缺少 ]")
-            expr = Index(expr, key)
+        while True:
+            if self._match("LBRACKET"):
+                key = self.expr()
+                self._expect("RBRACKET", "索引缺少 ]")
+                expr = Index(expr, key)
+                continue
+            if self._match("DOT"):
+                expr = Property(expr, self._expect("IDENT", "属性名不合法").value)
+                continue
+            break
 
         if self._is("ASSIGN"):
             return expr
 
         self.i = start
         return None
+
+    def class_stmt(self) -> ClassDef:
+        name = self._expect("IDENT", "定义类 缺少类名").value
+        return ClassDef(name, self.block())
 
     def if_stmt(self) -> IfStmt:
         cond = self._paren_expr("如果")
@@ -434,6 +458,8 @@ class Parser:
             if self._match("LPAREN"): x = self._call(x)
             elif self._match("LBRACKET"):
                 key = self.expr(); self._expect("RBRACKET", "索引缺少 ]"); x = Index(x, key)
+            elif self._match("DOT"):
+                x = Property(x, self._expect("IDENT", "属性名不合法").value)
             else: break
         return x
 
@@ -535,6 +561,62 @@ class UserFunc:
         return None
 
 
+class BoundMethod:
+    def __init__(self, instance: "DSLInstance", func: UserFunc) -> None:
+        self.instance = instance
+        self.func = func
+
+    def call(self, it: "Interpreter", args: list[Any], kwargs: dict[str, Any]) -> Any:
+        return self.func.call(it, [self.instance, *args], kwargs)
+
+
+class DSLClass:
+    def __init__(self, name: str, env: Env) -> None:
+        self.name = name
+        self.env = env
+
+    def get_attr(self, name: str) -> Any:
+        if name in self.env.v:
+            return self.env.v[name]
+        raise DSLRuntimeError(f"类 {self.name} 没有属性或方法：{name}")
+
+    def set_attr(self, name: str, value: Any) -> None:
+        self.env.set(name, value)
+
+    def instantiate(self, it: "Interpreter", args: list[Any], kwargs: dict[str, Any]) -> Any:
+        instance = DSLInstance(self)
+        if "初始化" in self.env.v:
+            init_func = self.env.v["初始化"]
+            if not isinstance(init_func, UserFunc):
+                raise DSLRuntimeError("初始化 必须是方法")
+            BoundMethod(instance, init_func).call(it, args, kwargs)
+        elif kwargs:
+            raise DSLRuntimeError("当前类未定义 初始化，不能使用命名参数创建对象")
+        elif args:
+            raise DSLRuntimeError(f"类 {self.name} 未定义 初始化，不能传入构造参数")
+        return instance
+
+
+class DSLInstance:
+    def __init__(self, cls: DSLClass) -> None:
+        self.cls = cls
+        self.fields: dict[str, Any] = {}
+
+    def get_attr(self, name: str) -> Any:
+        if name in self.fields:
+            return self.fields[name]
+        value = self.cls.get_attr(name)
+        if isinstance(value, UserFunc):
+            return BoundMethod(self, value)
+        return value
+
+    def set_attr(self, name: str, value: Any) -> None:
+        self.fields[name] = value
+
+    def __repr__(self) -> str:
+        return f"<{self.cls.name}对象 {self.fields}>"
+
+
 class Interpreter:
     def __init__(self) -> None:
         self.globals = Env()
@@ -583,6 +665,10 @@ class Interpreter:
                 except Ctn: continue
                 except Brk: break
         elif isinstance(s, FuncDef): env.define(s.name, UserFunc(s, env))
+        elif isinstance(s, ClassDef):
+            class_env = Env(env)
+            self.block(s.block, class_env)
+            env.define(s.name, DSLClass(s.name, class_env))
         elif isinstance(s, ReturnStmt): raise Ret(self.eval(s.value, env) if s.value is not None else None)
         elif isinstance(s, ContinueStmt): raise Ctn()
         elif isinstance(s, BreakStmt): raise Brk()
@@ -600,6 +686,12 @@ class Interpreter:
             except Exception as e:
                 raise DSLRuntimeError("数组/字典下标赋值失败") from e
             return
+        if isinstance(target, Property):
+            obj = self.eval(target.target, env)
+            if isinstance(obj, (DSLInstance, DSLClass)):
+                obj.set_attr(target.name, value)
+                return
+            raise DSLRuntimeError("属性赋值目标必须是对象或类")
         raise DSLRuntimeError("不支持的赋值目标")
 
     def eval(self, e: Expr, env: Env) -> Any:
@@ -633,10 +725,17 @@ class Interpreter:
             for a in e.args:
                 if a.name is None: args.append(self.eval(a.value, env))
                 else: kwargs[a.name] = self.eval(a.value, env)
+            if isinstance(f, BoundMethod): return f.call(self, args, kwargs)
+            if isinstance(f, DSLClass): return f.instantiate(self, args, kwargs)
             if isinstance(f, UserFunc): return f.call(self, args, kwargs)
             if callable(f): return f(*args, **kwargs)
             raise DSLRuntimeError("被调用对象不是函数")
         if isinstance(e, Index): return self.eval(e.target, env)[self.eval(e.key, env)]
+        if isinstance(e, Property):
+            obj = self.eval(e.target, env)
+            if isinstance(obj, (DSLInstance, DSLClass)):
+                return obj.get_attr(e.name)
+            raise DSLRuntimeError("属性访问目标必须是对象或类")
         raise DSLRuntimeError("未知表达式")
 
     def truth(self, x: Any) -> bool:
@@ -662,6 +761,7 @@ class PythonTranspiler:
             self.n += 1; out.append(f"{p}for _repeat_{self.n} in range({self.e(s.times)}):"); self.b(s.block, out, d + 1)
         elif isinstance(s, ForStmt): out.append(f"{p}for {s.name} in {self.e(s.iterable)}:"); self.b(s.block, out, d + 1)
         elif isinstance(s, FuncDef): out.append(f"{p}def {s.name}({', '.join(s.params)}):"); self.b(s.block, out, d + 1)
+        elif isinstance(s, ClassDef): out.append(f"{p}class {s.name}:"); self.b(s.block, out, d + 1)
         elif isinstance(s, ReturnStmt): out.append(f"{p}return" + ("" if s.value is None else f" {self.e(s.value)}"))
         elif isinstance(s, ContinueStmt): out.append(f"{p}continue")
         elif isinstance(s, BreakStmt): out.append(f"{p}break")
@@ -679,6 +779,7 @@ class PythonTranspiler:
             args = [self.e(a.value) if a.name is None else f"{a.name}={self.e(a.value)}" for a in e.args]
             return f"{self.e(e.callee)}(" + ", ".join(args) + ")"
         if isinstance(e, Index): return f"{self.e(e.target)}[{self.e(e.key)}]"
+        if isinstance(e, Property): return f"{self.e(e.target)}.{e.name}"
         raise DSLError("未知表达式")
 
 
